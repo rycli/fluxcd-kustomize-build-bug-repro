@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# vim: ft=bash
+# Demonstrates orphaned artifact accumulation when flux builds are killed.
+#
+# Flux's WriteFile creates .original backups and kustomize creates temp dirs.
+# When killed (OOM, SIGKILL, pod eviction), defer-based cleanup never runs.
+#
+# With simple local manifests, builds complete too fast to reliably catch
+# mid-write. This script uses concurrent builds + SIGKILL to maximize the
+# window. More reproducible in-cluster with remote GitRepository sources.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KS_FILE="$SCRIPT_DIR/kustomization.yaml"
+WORK_DIR="$SCRIPT_DIR/.tmp/kill-test"
+M="${1:-50}"
+
+export TMPDIR="$SCRIPT_DIR/.tmp/tmpdir-exhaust"
+rm -rf "$TMPDIR" "$WORK_DIR"
+mkdir -p "$TMPDIR" "$WORK_DIR"
+cp "$SCRIPT_DIR/kustomize/"* "$WORK_DIR/"
+
+echo "Launching $M concurrent flux builds, then killing all via SIGKILL"
+echo "---"
+
+pids=()
+for i in $(seq 1 "$M"); do
+  flux build kustomization repro-test \
+    --path "$WORK_DIR" \
+    --kustomization-file "$KS_FILE" \
+    --dry-run >/dev/null 2>/dev/null &
+  pids+=($!)
+done
+
+# Suppress bash "Killed" job control messages during kill+wait
+exec 3>&2 2>/dev/null
+sleep 0.03
+for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null; done
+for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+exec 2>&3 3>&-
+
+originals=$(find "$WORK_DIR" -name '*.original' 2>/dev/null | wc -l | tr -d ' ')
+tmpfiles=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+corrupted=0
+if ! grep -q 'configmap.yaml' "$WORK_DIR/kustomization.yaml" 2>/dev/null; then
+  corrupted=1
+fi
+
+echo "Leftover .original files: $originals"
+echo "Orphaned TMPDIR entries:  $tmpfiles"
+echo "kustomization.yaml corrupted: $([ "$corrupted" -eq 1 ] && echo YES || echo no)"
+
+[ "$originals" -gt 0 ] && echo "" && ls -la "$WORK_DIR"/*.original
+[ "$tmpfiles" -gt 0 ] && echo "" && ls -1 "$TMPDIR" | head -10
+
+if [ "$originals" -eq 0 ] && [ "$tmpfiles" -eq 0 ] && [ "$corrupted" -eq 0 ]; then
+  echo ""
+  echo "No artifacts detected. With simple local manifests, builds complete"
+  echo "faster than the kill window. This is more reliably reproduced:"
+  echo "  - In-cluster with remote GitRepository sources"
+  echo "  - With larger kustomizations that take longer to build"
+  echo "  - With network-dependent resources (Helm charts, remote bases)"
+fi

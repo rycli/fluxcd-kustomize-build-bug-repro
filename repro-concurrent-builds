@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# vim: ft=bash
+# Reproduces file contention when multiple flux build kustomization processes
+# target the same source directory concurrently.
+#
+# Flux's kustomize generator calls WriteFile() which reads, modifies, and
+# writes kustomization.yaml, then restores the original via CleanDirectory().
+# Concurrent processes race on these read/write/restore operations.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KUSTOMIZE_DIR="$SCRIPT_DIR/kustomize"
+KS_FILE="$SCRIPT_DIR/kustomization.yaml"
+N="${1:-30}"
+
+ORIGINAL_CONTENT=$(cat "$KUSTOMIZE_DIR/kustomization.yaml")
+cleanup() {
+  echo "$ORIGINAL_CONTENT" > "$KUSTOMIZE_DIR/kustomization.yaml"
+  rm -f "$KUSTOMIZE_DIR"/*.original
+}
+trap cleanup EXIT
+
+echo "Spawning $N concurrent 'flux build kustomization' against $KUSTOMIZE_DIR"
+echo "---"
+
+pids=()
+tmpdir="$SCRIPT_DIR/.tmp/concurrent-builds"
+rm -rf "$tmpdir"
+mkdir -p "$tmpdir"
+
+for i in $(seq 1 "$N"); do
+  (
+    flux build kustomization repro-test \
+      --path "$KUSTOMIZE_DIR" \
+      --kustomization-file "$KS_FILE" \
+      --dry-run \
+      >"$tmpdir/stdout.$i" 2>"$tmpdir/stderr.$i"
+    echo "$?" >"$tmpdir/exit.$i"
+  ) &
+  pids+=($!)
+done
+
+failures=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || ((failures++)) || true
+done
+
+echo "Results: $((N - failures))/$N succeeded, $failures/$N failed"
+echo ""
+
+for i in $(seq 1 "$N"); do
+  stderr_file="$tmpdir/stderr.$i"
+  if [ -s "$stderr_file" ]; then
+    echo "--- process $i stderr ---"
+    cat "$stderr_file"
+  fi
+done
+
+# Check if kustomization.yaml was left in a corrupted state
+if ! grep -q 'configmap.yaml' "$KUSTOMIZE_DIR/kustomization.yaml" 2>/dev/null; then
+  echo ""
+  echo "BUG: kustomization.yaml is corrupted after concurrent builds:"
+  cat "$KUSTOMIZE_DIR/kustomization.yaml"
+fi
+
+# Check for leftover .original backup files
+if ls "$KUSTOMIZE_DIR"/*.original 2>/dev/null; then
+  echo ""
+  echo "BUG: .original backup files left behind:"
+  ls -la "$KUSTOMIZE_DIR"/*.original
+fi
+
+# Compare outputs for consistency
+ref="$tmpdir/stdout.1"
+for i in $(seq 2 "$N"); do
+  if [ -s "$tmpdir/stdout.$i" ] && ! diff -q "$ref" "$tmpdir/stdout.$i" >/dev/null 2>&1; then
+    echo ""
+    echo "BUG: output of process $i differs from process 1:"
+    diff "$ref" "$tmpdir/stdout.$i" || true
+  fi
+done

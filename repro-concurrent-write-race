@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# vim: ft=bash
+# Simulates the exact race condition in kustomize_generator.go WriteFile/CleanDirectory.
+#
+# The race:
+#   Process A: read kustomization.yaml -> modify -> write kustomization.yaml
+#   Process B: read kustomization.yaml (gets A's modified version) -> modify -> write
+#   Process A: restore kustomization.yaml from .original backup
+#   Process B: restore kustomization.yaml from .original (which may not exist or be stale)
+#
+# This causes corrupted reads, missing .original files, and garbled YAML.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORK_DIR="$SCRIPT_DIR/.tmp/write-race"
+N="${1:-20}"
+ITERATIONS="${2:-50}"
+
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR"
+
+ORIGINAL_CONTENT="apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap.yaml"
+
+echo "$ORIGINAL_CONTENT" > "$WORK_DIR/kustomization.yaml"
+ORIGINAL_SUM=$(echo "$ORIGINAL_CONTENT" | shasum -a 256 | cut -d' ' -f1)
+
+echo "Simulating WriteFile/CleanDirectory race with $N processes x $ITERATIONS iterations"
+echo "Original checksum: $ORIGINAL_SUM"
+echo "---"
+
+simulate_flux_write() {
+  local id=$1
+  local errors=0
+  for _ in $(seq 1 "$ITERATIONS"); do
+    # WriteFile: read -> modify -> write (+ save .original)
+    content=$(cat "$WORK_DIR/kustomization.yaml" 2>/dev/null) || { ((errors++)); continue; }
+    cp "$WORK_DIR/kustomization.yaml" "$WORK_DIR/kustomization.yaml.original" 2>/dev/null || true
+    echo "${content}" | gsed "s/configmap.yaml/configmap.yaml # modified by $id/" \
+      > "$WORK_DIR/kustomization.yaml" 2>/dev/null || { ((errors++)); continue; }
+
+    # CleanDirectory: restore from .original
+    if [ -f "$WORK_DIR/kustomization.yaml.original" ]; then
+      mv "$WORK_DIR/kustomization.yaml.original" "$WORK_DIR/kustomization.yaml" 2>/dev/null || ((errors++))
+    fi
+  done
+  echo "$errors" > "$WORK_DIR/errors.$id"
+}
+
+pids=()
+for i in $(seq 1 "$N"); do
+  simulate_flux_write "$i" &
+  pids+=($!)
+done
+
+for pid in "${pids[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+
+# Check final state
+final_content=$(cat "$WORK_DIR/kustomization.yaml" 2>/dev/null || echo "FILE MISSING")
+final_sum=$(echo "$final_content" | shasum -a 256 | cut -d' ' -f1)
+
+total_errors=0
+for i in $(seq 1 "$N"); do
+  e=$(cat "$WORK_DIR/errors.$i" 2>/dev/null || echo 0)
+  total_errors=$((total_errors + e))
+done
+
+echo "Total I/O errors across all processes: $total_errors"
+echo ""
+
+if [ "$final_sum" != "$ORIGINAL_SUM" ]; then
+  echo "BUG: kustomization.yaml is corrupted after race"
+  echo "Expected checksum: $ORIGINAL_SUM"
+  echo "Got checksum:      $final_sum"
+  echo ""
+  echo "Final content:"
+  cat "$WORK_DIR/kustomization.yaml"
+else
+  echo "File checksum matches original (may still have had transient corruption)"
+fi
+
+if [ -f "$WORK_DIR/kustomization.yaml.original" ]; then
+  echo ""
+  echo "BUG: .original backup file left behind"
+fi

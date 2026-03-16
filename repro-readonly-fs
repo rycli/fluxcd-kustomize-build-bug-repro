@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# vim: ft=bash
+# Reproduces failures when flux build kustomization targets a read-only directory.
+#
+# Flux's WriteFile() writes a modified kustomization.yaml and creates .original
+# backups. On a read-only filesystem these writes fail with EPERM/EROFS.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KS_FILE="$SCRIPT_DIR/kustomization.yaml"
+RO_DIR="$SCRIPT_DIR/.tmp/ro-kustomize"
+
+cleanup() {
+  chmod -R u+w "$RO_DIR" 2>/dev/null || true
+  rm -rf "$RO_DIR"
+}
+trap cleanup EXIT
+
+rm -rf "$RO_DIR"
+mkdir -p "$RO_DIR"
+cp "$SCRIPT_DIR/kustomize/"* "$RO_DIR/"
+
+echo "Making $RO_DIR read-only"
+chmod -R a-w "$RO_DIR"
+
+echo "Running flux build kustomization against read-only directory..."
+echo "---"
+
+flux build kustomization repro-test \
+  --path "$RO_DIR" \
+  --kustomization-file "$KS_FILE" \
+  --dry-run 2>&1
+rc=$?
+
+echo "---"
+echo "Exit code: $rc"
+
+if [ "$rc" -ne 0 ]; then
+  echo "CONFIRMED: flux build kustomization fails on read-only filesystem"
+else
+  echo "NOTE: build succeeded — the version of flux may handle read-only gracefully"
+fi
