@@ -51,14 +51,7 @@ echo "Leftover .original files: $originals"
 echo "Orphaned TMPDIR entries:  $tmpfiles"
 echo "kustomization.yaml corrupted: $([ "$corrupted" -eq 1 ] && echo YES || echo no)"
 
-[ "$originals" -gt 0 ] && echo "" && ls -la "$WORK_DIR"/*.original
-[ "$tmpfiles" -gt 0 ] && echo "" && ls -1 "$TMPDIR" | head -10
+strip() { gsed "s|$SCRIPT_DIR/||g"; }
+[ "$originals" -gt 0 ] && echo "" && ls -la "$WORK_DIR"/*.original | strip
+[ "$tmpfiles" -gt 0 ] && echo "" && ls -1 "$TMPDIR" | strip | head -10
 
-if [ "$originals" -eq 0 ] && [ "$tmpfiles" -eq 0 ] && [ "$corrupted" -eq 0 ]; then
-  echo ""
-  echo "No artifacts detected. With simple local manifests, builds complete"
-  echo "faster than the kill window. This is more reliably reproduced:"
-  echo "  - In-cluster with remote GitRepository sources"
-  echo "  - With larger kustomizations that take longer to build"
-  echo "  - With network-dependent resources (Helm charts, remote bases)"
-fi

@@ -73,18 +73,11 @@ done
 echo "Total I/O errors across all processes: $total_errors"
 echo ""
 
-if [ "$final_sum" != "$ORIGINAL_SUM" ]; then
-  echo "BUG: kustomization.yaml is corrupted after race"
-  echo "Expected checksum: $ORIGINAL_SUM"
-  echo "Got checksum:      $final_sum"
-  echo ""
-  echo "Final content:"
-  cat "$WORK_DIR/kustomization.yaml"
-else
-  echo "File checksum matches original (may still have had transient corruption)"
-fi
+echo "Expected checksum: $ORIGINAL_SUM"
+echo "Final checksum:    $final_sum"
+echo "Checksums match:   $([ "$final_sum" = "$ORIGINAL_SUM" ] && echo yes || echo no)"
+echo ""
+echo "Final content:"
+cat "$WORK_DIR/kustomization.yaml"
 
-if [ -f "$WORK_DIR/kustomization.yaml.original" ]; then
-  echo ""
-  echo "BUG: .original backup file left behind"
-fi
+[ -f "$WORK_DIR/kustomization.yaml.original" ] && echo "" && echo "Leftover .original backup file present"

@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KUSTOMIZE_DIR="$SCRIPT_DIR/kustomize"
 KS_FILE="$SCRIPT_DIR/kustomization.yaml"
 N="${1:-30}"
+strip() { gsed "s|$SCRIPT_DIR/||g"; }
 
 ORIGINAL_CONTENT=$(cat "$KUSTOMIZE_DIR/kustomization.yaml")
 cleanup() {
@@ -21,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Spawning $N concurrent 'flux build kustomization' against $KUSTOMIZE_DIR"
+echo "Spawning $N concurrent 'flux build kustomization' against ./kustomize"
 echo "---"
 
 pids=()
@@ -46,37 +47,15 @@ for pid in "${pids[@]}"; do
   wait "$pid" || ((failures++)) || true
 done
 
-echo "Results: $((N - failures))/$N succeeded, $failures/$N failed"
-echo ""
+echo "Succeeded: $((N - failures))/$N"
+echo "Failed:    $failures/$N"
 
 for i in $(seq 1 "$N"); do
-  stderr_file="$tmpdir/stderr.$i"
-  if [ -s "$stderr_file" ]; then
-    echo "--- process $i stderr ---"
-    cat "$stderr_file"
-  fi
+  [ -s "$tmpdir/stderr.$i" ] && echo "" && echo "process $i stderr:" && cat "$tmpdir/stderr.$i" | strip
 done
 
-# Check if kustomization.yaml was left in a corrupted state
 if ! grep -q 'configmap.yaml' "$KUSTOMIZE_DIR/kustomization.yaml" 2>/dev/null; then
-  echo ""
-  echo "BUG: kustomization.yaml is corrupted after concurrent builds:"
-  cat "$KUSTOMIZE_DIR/kustomization.yaml"
+  echo "" && echo "kustomization.yaml after run:" && cat "$KUSTOMIZE_DIR/kustomization.yaml"
 fi
 
-# Check for leftover .original backup files
-if ls "$KUSTOMIZE_DIR"/*.original 2>/dev/null; then
-  echo ""
-  echo "BUG: .original backup files left behind:"
-  ls -la "$KUSTOMIZE_DIR"/*.original
-fi
-
-# Compare outputs for consistency
-ref="$tmpdir/stdout.1"
-for i in $(seq 2 "$N"); do
-  if [ -s "$tmpdir/stdout.$i" ] && ! diff -q "$ref" "$tmpdir/stdout.$i" >/dev/null 2>&1; then
-    echo ""
-    echo "BUG: output of process $i differs from process 1:"
-    diff "$ref" "$tmpdir/stdout.$i" || true
-  fi
-done
+ls "$KUSTOMIZE_DIR"/*.original 2>/dev/null | strip && echo "" && ls -la "$KUSTOMIZE_DIR"/*.original | strip

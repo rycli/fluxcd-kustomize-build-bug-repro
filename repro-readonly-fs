@@ -21,7 +21,7 @@ rm -rf "$RO_DIR"
 mkdir -p "$RO_DIR"
 cp "$SCRIPT_DIR/kustomize/"* "$RO_DIR/"
 
-echo "Making $RO_DIR read-only"
+echo "Making .tmp/ro-kustomize read-only"
 chmod -R a-w "$RO_DIR"
 
 echo "Running flux build kustomization against read-only directory..."
@@ -30,14 +30,10 @@ echo "---"
 flux build kustomization repro-test \
   --path "$RO_DIR" \
   --kustomization-file "$KS_FILE" \
-  --dry-run 2>&1
-rc=$?
+  --dry-run 2>&1 | gsed "s|$SCRIPT_DIR/||g"
+rc=${PIPESTATUS[0]}
 
 echo "---"
 echo "Exit code: $rc"
 
-if [ "$rc" -ne 0 ]; then
-  echo "CONFIRMED: flux build kustomization fails on read-only filesystem"
-else
-  echo "NOTE: build succeeded — the version of flux may handle read-only gracefully"
-fi
+exit "$rc"

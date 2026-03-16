@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 # vim: ft=bash
 # Entrypoint: runs all flux kustomize bug reproduction scripts.
-# Usage: ./repro [test...]
-#   No arguments runs all tests. Pass test names to run specific ones:
+# Usage: ./repro [name...]
+#   No arguments runs all. Pass names to run specific ones:
 #   ./repro readonly concurrent-builds
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BOLD='\033[1m'
-RESET='\033[0m'
 
 tests=(
   "readonly:repro-readonly-fs:Read-only filesystem write failure"
@@ -31,29 +27,16 @@ else
     done
   done
   if [ ${#selected[@]} -eq 0 ]; then
-    echo "Unknown test(s): $*"
+    echo "Unknown: $*"
     echo "Available: $(printf '%s ' "${tests[@]}" | gsed 's/:[^ ]*//g')"
     exit 1
   fi
 fi
 
-passed=0
-failed=0
-total=${#selected[@]}
-
 for t in "${selected[@]}"; do
   IFS=: read -r name script desc <<< "$t"
-  printf "\n${BOLD}[%s] %s${RESET}\n" "$name" "$desc"
-  printf '%.0s-' {1..60}; echo ""
-
-  if "$SCRIPT_DIR/$script"; then
-    printf "${GREEN}--- PASS: %s${RESET}\n" "$name"
-    ((passed++))
-  else
-    printf "${RED}--- FAIL: %s (exit %d)${RESET}\n" "$name" "$?"
-    ((failed++))
-  fi
+  echo ""
+  echo "$desc"
+  printf '%.0s-' $(seq 1 ${#desc}); echo ""
+  "$SCRIPT_DIR/$script"
 done
-
-printf "\n${BOLD}Results: %d/%d passed, %d/%d failed${RESET}\n" "$passed" "$total" "$failed" "$total"
-exit "$failed"
