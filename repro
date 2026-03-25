@@ -4,10 +4,22 @@
 # Usage: ./repro [name...]
 #   No arguments runs all. Pass names to run specific ones:
 #   ./repro readonly concurrent-builds
+#
+# Runs each test twice — once with flux-before (unpatched) and once with
+# flux-after (patched) — and prints a side-by-side comparison.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR="$SCRIPT_DIR/.tmp/bin"
+
+FLUX_BEFORE="$BIN_DIR/flux-before"
+FLUX_AFTER="$BIN_DIR/flux-after"
+
+if [ ! -x "$FLUX_BEFORE" ] || [ ! -x "$FLUX_AFTER" ]; then
+  echo "Missing flux-before or flux-after. Run ./setup first."
+  exit 1
+fi
 
 tests=(
   "readonly:repro-readonly-fs:Read-only filesystem write failure"
@@ -32,10 +44,87 @@ else
   fi
 fi
 
+# Detect failure from test output.
+# Each test has different failure signatures:
+#   readonly:           "Exit code: 1" or "permission denied"
+#   concurrent-builds:  "Failed:    N/N" where N > 0, or "is empty"
+#   tmp-exhaustion:     "corrupted: YES" or "Leftover .original files: N" where N > 0
+has_failure() {
+  local name="$1" output="$2"
+  case "$name" in
+    readonly)
+      echo "$output" | grep -qE 'Exit code: [^0]|permission denied' ;;
+    concurrent-builds)
+      echo "$output" | grep -qP 'Failed:\s+[1-9]|is empty|\.original' ;;
+    tmp-exhaustion)
+      echo "$output" | grep -qE 'corrupted: YES|Leftover .original files: [1-9]|Orphaned TMPDIR entries:  [1-9]' ;;
+  esac
+}
+
+fixed=0
+not_affected=0
+broken=0
+regressed=0
+
+results=()
+
 for t in "${selected[@]}"; do
   IFS=: read -r name script desc <<< "$t"
+
   echo ""
+  echo "================================================================"
   echo "$desc"
-  printf '%.0s-' $(seq 1 ${#desc}); echo ""
-  "$SCRIPT_DIR/$script"
+  echo "================================================================"
+
+  echo ""
+  echo "--- before fix ---"
+  ln -sf "$FLUX_BEFORE" "$BIN_DIR/flux"
+  export PATH="$BIN_DIR:$PATH"
+  before_out=$("$SCRIPT_DIR/$script" 2>&1) || true
+  echo "$before_out"
+  has_failure "$name" "$before_out" && before_fail=1 || before_fail=0
+
+  echo ""
+  echo "--- after fix ---"
+  ln -sf "$FLUX_AFTER" "$BIN_DIR/flux"
+  after_out=$("$SCRIPT_DIR/$script" 2>&1) || true
+  echo "$after_out"
+  has_failure "$name" "$after_out" && after_fail=1 || after_fail=0
+
+  echo ""
+  if [ "$before_fail" -eq 1 ] && [ "$after_fail" -eq 0 ]; then
+    verdict="FIXED"
+    ((fixed++))
+  elif [ "$before_fail" -eq 0 ] && [ "$after_fail" -eq 0 ]; then
+    verdict="OK (not affected)"
+    ((not_affected++))
+  elif [ "$before_fail" -eq 1 ] && [ "$after_fail" -eq 1 ]; then
+    verdict="BROKEN (not fixed)"
+    ((broken++))
+  else
+    verdict="REGRESSED"
+    ((regressed++))
+  fi
+  printf '>> %-24s before=%-4s after=%-4s %s\n' \
+    "$name" \
+    "$([ "$before_fail" -eq 1 ] && echo FAIL || echo PASS)" \
+    "$([ "$after_fail" -eq 1 ] && echo FAIL || echo PASS)" \
+    "$verdict"
+  results+=("$(printf '  %-24s before=%-4s after=%-4s %s' \
+    "$name" \
+    "$([ "$before_fail" -eq 1 ] && echo FAIL || echo PASS)" \
+    "$([ "$after_fail" -eq 1 ] && echo FAIL || echo PASS)" \
+    "$verdict")")
 done
+
+rm -f "$BIN_DIR/flux"
+
+echo ""
+echo "================================================================"
+echo "Summary"
+echo "================================================================"
+for r in "${results[@]}"; do echo "$r"; done
+echo ""
+echo "  fixed: $fixed  ok: $not_affected  broken: $broken  regressed: $regressed"
+
+[ "$broken" -eq 0 ] && [ "$regressed" -eq 0 ]

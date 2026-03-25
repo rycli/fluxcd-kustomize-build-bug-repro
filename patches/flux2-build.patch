@@ -1,0 +1,60 @@
+diff --git a/internal/build/build.go b/internal/build/build.go
+index 7deca47..f32132b 100644
+--- a/internal/build/build.go
++++ b/internal/build/build.go
+@@ -378,24 +378,16 @@ func (b *Builder) build() (m resmap.ResMap, err error) {
+ 	b.kustomization = k
+ 
+ 	// generate kustomization.yaml if needed
+-	action, er := b.generate(*k, b.resourcesPath)
++	memFS, workDir, action, er := b.generate(*k, b.resourcesPath)
+ 	if er != nil {
+-		errf := kustomize.CleanDirectory(b.resourcesPath, action)
+-		err = fmt.Errorf("failed to generate kustomization.yaml: %w", fmt.Errorf("%v %v", er, errf))
++		err = fmt.Errorf("failed to generate kustomization.yaml: %w", er)
+ 		return
+ 	}
+ 
+ 	b.action = action
+ 
+-	defer func() {
+-		errf := b.Cancel()
+-		if err == nil {
+-			err = errf
+-		}
+-	}()
+-
+ 	// build the kustomization
+-	m, err = b.do(ctx, *k, b.resourcesPath)
++	m, err = b.do(ctx, *k, memFS, workDir)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -490,10 +482,10 @@ func (b *Builder) unMarshallKustomization() (*kustomizev1.Kustomization, error)
+ 	return k, nil
+ }
+ 
+-func (b *Builder) generate(kustomization kustomizev1.Kustomization, dirPath string) (kustomize.Action, error) {
++func (b *Builder) generate(kustomization kustomizev1.Kustomization, dirPath string) (memFS filesys.FileSystem, workDir string, action kustomize.Action, err error) {
+ 	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&kustomization)
+ 	if err != nil {
+-		return "", err
++		return nil, "", "", err
+ 	}
+ 
+ 	// a scanner will be used down the line to parse the list
+@@ -505,12 +497,10 @@ func (b *Builder) generate(kustomization kustomizev1.Kustomization, dirPath stri
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 
+-	return gen.WriteFile(dirPath, kustomize.WithSaveOriginalKustomization())
++	return gen.SafeWriteFile(dirPath)
+ }
+ 
+-func (b *Builder) do(ctx context.Context, kustomization kustomizev1.Kustomization, dirPath string) (resmap.ResMap, error) {
+-	fs := filesys.MakeFsOnDisk()
+-
++func (b *Builder) do(ctx context.Context, kustomization kustomizev1.Kustomization, fs filesys.FileSystem, dirPath string) (resmap.ResMap, error) {
+ 	// acquire the lock
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
