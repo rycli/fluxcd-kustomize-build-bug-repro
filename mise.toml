@@ -17,7 +17,15 @@ outputs = [".tmp/bin/flux-before", ".tmp/bin/flux-after"]
 
 [tasks.test]
 description = "Run reproduction tests (all or by name)"
-run = "./repro {{arg(name='test', default='')}}"
+run = "test={{arg(name='test', default='')}}; ./repro ${test:+\"$test\"}"
+depends = ["build"]
+
+[tasks."test:pick"]
+description = "Select a test to run with fzf"
+run = """
+test=$(printf 'readonly\nconcurrent-builds\ntmp-exhaustion' | fzf --prompt='test> ')
+[ -n "$test" ] && ./repro "$test"
+"""
 depends = ["build"]
 
 [tasks."test:readonly"]
