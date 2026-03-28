@@ -1,0 +1,6 @@
+[submodule "fluxcd-flux2"]
+	path = fluxcd-flux2
+	url = https://github.com/rycli/fluxcd-flux2.git
+[submodule "fluxcd-pkg"]
+	path = fluxcd-pkg
+	url = https://github.com/rycli/fluxcd-pkg.git
