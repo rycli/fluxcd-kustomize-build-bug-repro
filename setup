@@ -1,38 +1,29 @@
 #!/usr/bin/env bash
 # vim: ft=bash
-# Clone FluxCD source and build the flux CLI binary with and without the fix.
-# Artifacts land in .tmp/ (gitignored). Idempotent — skips clone if present.
+# Build the flux CLI binary with and without the fix using the forked submodules.
+# Artifacts land in .tmp/bin/ (gitignored). Idempotent — safe to re-run.
 # Produces two binaries: .tmp/bin/flux-before and .tmp/bin/flux-after
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FLUX2_DIR="$SCRIPT_DIR/.tmp/flux2"
-PKG_DIR="$SCRIPT_DIR/.tmp/pkg"
+FLUX2_DIR="$SCRIPT_DIR/fluxcd-flux2"
+PKG_DIR="$SCRIPT_DIR/fluxcd-pkg"
 BIN_DIR="$SCRIPT_DIR/.tmp/bin"
 PATCH_DIR="$SCRIPT_DIR/patches"
 
-# Pinned commits that the patches were generated against.
-FLUX2_COMMIT="d9f51d047dbb2e3184539ca40740f7b6f808f8d7"
-PKG_COMMIT="357bbcc3462ccf78cc17fd0b9b7d498b1848bf14"
+cleanup() {
+  echo ""
+  echo "restoring submodules to clean state..."
+  git -C "$PKG_DIR" checkout -- . 2>/dev/null || true
+  git -C "$FLUX2_DIR" checkout -- . 2>/dev/null || true
+}
+trap cleanup EXIT
 
-# -- clone ------------------------------------------------------------------
+# -- reset submodules ------------------------------------------------------
 
-if [ -d "$FLUX2_DIR/.git" ]; then
-  echo "flux2: already cloned"
-else
-  echo "flux2: cloning..."
-  git clone https://github.com/fluxcd/flux2.git "$FLUX2_DIR"
-  git -C "$FLUX2_DIR" checkout "$FLUX2_COMMIT"
-fi
-
-if [ -d "$PKG_DIR/.git" ]; then
-  echo "pkg: already cloned"
-else
-  echo "pkg: cloning..."
-  git clone https://github.com/fluxcd/pkg.git "$PKG_DIR"
-  git -C "$PKG_DIR" checkout "$PKG_COMMIT"
-fi
+git -C "$PKG_DIR" checkout -- . 2>/dev/null || true
+git -C "$FLUX2_DIR" checkout -- . 2>/dev/null || true
 
 # -- stub embedded manifests ------------------------------------------------
 # cmd/flux/manifests.embed.go has //go:embed manifests/*.yaml which fails
@@ -48,18 +39,9 @@ mkdir -p "$BIN_DIR"
 
 # -- build before-fix -------------------------------------------------------
 
-echo ""
 echo "=== building flux-before (unpatched) ==="
 
-cd "$PKG_DIR"
-git checkout -- . 2>/dev/null || true
-
 cd "$FLUX2_DIR"
-git checkout -- . 2>/dev/null || true
-# re-add the manifests stub (checkout may have removed it)
-mkdir -p "$FLUX2_DIR/cmd/flux/manifests"
-echo "# placeholder for go:embed" > "$FLUX2_DIR/cmd/flux/manifests/placeholder.yaml"
-
 CGO_ENABLED=0 go build -ldflags="-s -w" -o "$BIN_DIR/flux-before" ./cmd/flux
 echo "built: $BIN_DIR/flux-before"
 
@@ -68,18 +50,17 @@ echo "built: $BIN_DIR/flux-before"
 echo ""
 echo "=== building flux-after (patched) ==="
 
-cd "$PKG_DIR"
-git checkout -- . 2>/dev/null || true
+git -C "$PKG_DIR" checkout -- . 2>/dev/null || true
 echo "pkg: applying patch..."
-git apply "$PATCH_DIR/pkg-kustomize-generator.patch"
+git -C "$PKG_DIR" apply "$PATCH_DIR/pkg-kustomize-generator.patch"
 
-cd "$FLUX2_DIR"
-git checkout -- . 2>/dev/null || true
+git -C "$FLUX2_DIR" checkout -- . 2>/dev/null || true
 mkdir -p "$FLUX2_DIR/cmd/flux/manifests"
 echo "# placeholder for go:embed" > "$FLUX2_DIR/cmd/flux/manifests/placeholder.yaml"
 echo "flux2: applying patch..."
-git apply "$PATCH_DIR/flux2-build.patch"
+git -C "$FLUX2_DIR" apply "$PATCH_DIR/flux2-build.patch"
 
+cd "$FLUX2_DIR"
 if ! grep -q "replace github.com/fluxcd/pkg/kustomize =>" go.mod; then
   printf '\nreplace github.com/fluxcd/pkg/kustomize => %s/kustomize\n' "$PKG_DIR" >> go.mod
   go mod tidy 2>/dev/null

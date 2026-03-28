@@ -1,0 +1,43 @@
+[tools]
+go = "latest"
+
+[env]
+_.path = ["{{config_root}}/.tmp/bin"]
+
+[tasks.build]
+description = "Build unpatched and patched flux binaries"
+run = "./setup"
+sources = [
+  "setup",
+  "patches/*.patch",
+  "fluxcd-flux2/internal/build/build.go",
+  "fluxcd-pkg/kustomize/kustomize_generator.go",
+]
+outputs = [".tmp/bin/flux-before", ".tmp/bin/flux-after"]
+
+[tasks.test]
+description = "Run reproduction tests (all or by name)"
+run = "./repro {{arg(name='test', default='')}}"
+depends = ["build"]
+
+[tasks."test:readonly"]
+description = "Read-only FS test"
+run = "./repro readonly"
+depends = ["build"]
+hide = true
+
+[tasks."test:concurrent-builds"]
+description = "Concurrent builds test"
+run = "./repro concurrent-builds"
+depends = ["build"]
+hide = true
+
+[tasks."test:tmp-exhaustion"]
+description = "Orphaned artifacts test"
+run = "./repro tmp-exhaustion"
+depends = ["build"]
+hide = true
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "rm -rf .tmp/"
