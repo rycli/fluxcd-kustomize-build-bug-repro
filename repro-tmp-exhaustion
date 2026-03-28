@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# vim: ft=bash
+#!/usr/bin/env ruby
+# vim: ft=ruby
 # Demonstrates orphaned artifact accumulation when flux builds are killed.
 #
 # Flux's WriteFile creates .original backups and kustomize creates temp dirs.
@@ -9,49 +9,53 @@
 # mid-write. This script uses concurrent builds + SIGKILL to maximize the
 # window. More reproducible in-cluster with remote GitRepository sources.
 
-set -uo pipefail
+require "fileutils"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-KS_FILE="$SCRIPT_DIR/kustomization.yaml"
-WORK_DIR="$SCRIPT_DIR/.tmp/kill-test"
-M="${1:-50}"
+SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
+KS_FILE    = File.join(SCRIPT_DIR, "kustomization.yaml")
+WORK_DIR   = File.join(SCRIPT_DIR, ".tmp", "kill-test")
+TMPDIR     = File.join(SCRIPT_DIR, ".tmp", "tmpdir-exhaust")
+M          = (ARGV[0] || 50).to_i
 
-export TMPDIR="$SCRIPT_DIR/.tmp/tmpdir-exhaust"
-rm -rf "$TMPDIR" "$WORK_DIR"
-mkdir -p "$TMPDIR" "$WORK_DIR"
-cp "$SCRIPT_DIR/kustomize/"* "$WORK_DIR/"
+ENV["TMPDIR"] = TMPDIR
+FileUtils.rm_rf([TMPDIR, WORK_DIR])
+FileUtils.mkdir_p([TMPDIR, WORK_DIR])
+Dir.glob(File.join(SCRIPT_DIR, "kustomize", "*")).each { |f| FileUtils.cp(f, WORK_DIR) }
 
-echo "Launching $M concurrent flux builds, then killing all via SIGKILL"
-echo "---"
+puts "Launching #{M} concurrent flux builds, then killing all via SIGKILL"
+puts "---"
 
-pids=()
-for i in $(seq 1 "$M"); do
-  flux build kustomization repro-test \
-    --path "$WORK_DIR" \
-    --kustomization-file "$KS_FILE" \
-    --dry-run >/dev/null 2>/dev/null &
-  pids+=($!)
-done
+pids = M.times.map do
+  Process.spawn(
+    "flux", "build", "kustomization", "repro-test",
+    "--path", WORK_DIR,
+    "--kustomization-file", KS_FILE,
+    "--dry-run",
+    out: File::NULL, err: File::NULL
+  )
+end
 
-# Suppress bash "Killed" job control messages during kill+wait
-exec 3>&2 2>/dev/null
 sleep 0.03
-for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null; done
-for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
-exec 2>&3 3>&-
+pids.each { |pid| Process.kill("KILL", pid) rescue nil }
+pids.each { |pid| Process.wait(pid) rescue nil }
 
-originals=$(find "$WORK_DIR" -name '*.original' 2>/dev/null | wc -l | tr -d ' ')
-tmpfiles=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
-corrupted=0
-if ! grep -q 'configmap.yaml' "$WORK_DIR/kustomization.yaml" 2>/dev/null; then
-  corrupted=1
-fi
+originals = Dir.glob(File.join(WORK_DIR, "*.original")).size
+tmpfiles  = Dir.children(TMPDIR).size rescue 0
+ks_yaml   = File.join(WORK_DIR, "kustomization.yaml")
+corrupted = !File.read(ks_yaml).include?("configmap.yaml") rescue true
 
-echo "Leftover .original files: $originals"
-echo "Orphaned TMPDIR entries:  $tmpfiles"
-echo "kustomization.yaml corrupted: $([ "$corrupted" -eq 1 ] && echo YES || echo no)"
+puts "Leftover .original files: #{originals}"
+puts "Orphaned TMPDIR entries:  #{tmpfiles}"
+puts "kustomization.yaml corrupted: #{corrupted ? "YES" : "no"}"
 
-strip() { gsed "s|$SCRIPT_DIR/||g"; }
-[ "$originals" -gt 0 ] && echo "" && ls -la "$WORK_DIR"/*.original | strip
-[ "$tmpfiles" -gt 0 ] && echo "" && ls -1 "$TMPDIR" | strip | head -10
+strip = ->(s) { s.gsub("#{SCRIPT_DIR}/", "") }
 
+if originals > 0
+  puts ""
+  Dir.glob(File.join(WORK_DIR, "*.original")).each { |f| puts strip.call(`ls -la #{f}`.chomp) }
+end
+
+if tmpfiles > 0
+  puts ""
+  Dir.children(TMPDIR).first(10).each { |f| puts strip.call(f) }
+end

@@ -1,130 +1,148 @@
-#!/usr/bin/env bash
-# vim: ft=bash
+#!/usr/bin/env ruby
+# vim: ft=ruby
 # Entrypoint: runs all flux kustomize bug reproduction scripts.
 # Usage: ./repro [name...]
 #   No arguments runs all. Pass names to run specific ones:
 #   ./repro readonly concurrent-builds
 #
-# Runs each test twice — once with flux-before (unpatched) and once with
-# flux-after (patched) — and prints a side-by-side comparison.
+# Runs each test twice -- once with flux-before (unpatched) and once with
+# flux-after (patched) -- and prints a comparison with verdicts.
 
-set -uo pipefail
+require "open3"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN_DIR="$SCRIPT_DIR/.tmp/bin"
+SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
+BIN_DIR    = File.join(SCRIPT_DIR, ".tmp", "bin")
 
-FLUX_BEFORE="$BIN_DIR/flux-before"
-FLUX_AFTER="$BIN_DIR/flux-after"
+FLUX_BEFORE = File.join(BIN_DIR, "flux-before")
+FLUX_AFTER  = File.join(BIN_DIR, "flux-after")
+FLUX_LINK   = File.join(BIN_DIR, "flux")
 
-if [ ! -x "$FLUX_BEFORE" ] || [ ! -x "$FLUX_AFTER" ]; then
-  echo "Missing flux-before or flux-after. Run ./setup first."
-  exit 1
-fi
-
-tests=(
-  "readonly:repro-readonly-fs:Read-only filesystem write failure"
-  "concurrent-builds:repro-concurrent-builds:Concurrent flux build file contention"
-  "tmp-exhaustion:repro-tmp-exhaustion:Orphaned artifacts from killed builds"
-)
-
-selected=()
-if [ $# -eq 0 ]; then
-  selected=("${tests[@]}")
+# ANSI colors (disabled when not a terminal)
+if $stdout.tty?
+  R = "\033[31m"; G = "\033[32m"; C = "\033[36m"
+  B = "\033[1m";  D = "\033[2m";  X = "\033[0m"
 else
-  for arg in "$@"; do
-    for t in "${tests[@]}"; do
-      name="${t%%:*}"
-      [ "$name" = "$arg" ] && selected+=("$t")
-    done
-  done
-  if [ ${#selected[@]} -eq 0 ]; then
-    echo "Unknown: $*"
-    echo "Available: $(printf '%s ' "${tests[@]}" | gsed 's/:[^ ]*//g')"
-    exit 1
-  fi
-fi
+  R = G = C = B = D = X = ""
+end
 
-# Detect failure from test output.
-# Each test has different failure signatures:
-#   readonly:           "Exit code: 1" or "permission denied"
-#   concurrent-builds:  "Failed:    N/N" where N > 0, or "is empty"
-#   tmp-exhaustion:     "corrupted: YES" or "Leftover .original files: N" where N > 0
-has_failure() {
-  local name="$1" output="$2"
-  case "$name" in
-    readonly)
-      echo "$output" | grep -qE 'Exit code: [^0]|permission denied' ;;
-    concurrent-builds)
-      echo "$output" | grep -qP 'Failed:\s+[1-9]|is empty|\.original' ;;
-    tmp-exhaustion)
-      echo "$output" | grep -qE 'corrupted: YES|Leftover .original files: [1-9]|Orphaned TMPDIR entries:  [1-9]' ;;
-  esac
-}
+TESTS = [
+  { name: "readonly",          script: "repro-readonly-fs",      desc: "Read-only filesystem write failure" },
+  { name: "concurrent-builds", script: "repro-concurrent-builds", desc: "Concurrent flux build file contention" },
+  { name: "tmp-exhaustion",    script: "repro-tmp-exhaustion",    desc: "Orphaned artifacts from killed builds" },
+].freeze
 
-fixed=0
-not_affected=0
-broken=0
-regressed=0
+FAILURE_PATTERNS = {
+  "readonly"          => /Exit code: [^0]|permission denied/,
+  "concurrent-builds" => /Failed:\s+[1-9]|is empty|\.original/,
+  "tmp-exhaustion"    => /corrupted: YES|Leftover .original files: [1-9]|Orphaned TMPDIR entries:  [1-9]/,
+}.freeze
 
-results=()
+unless File.executable?(FLUX_BEFORE) && File.executable?(FLUX_AFTER)
+  $stderr.puts "#{R}Missing flux-before or flux-after. Run ./setup first.#{X}"
+  exit 1
+end
 
-for t in "${selected[@]}"; do
-  IFS=: read -r name script desc <<< "$t"
+# Select tests
+selected = if ARGV.empty?
+  TESTS
+else
+  ARGV.map do |arg|
+    TESTS.find { |t| t[:name] == arg } || begin
+      $stderr.puts "Unknown: #{arg}"
+      $stderr.puts "Available: #{TESTS.map { |t| t[:name] }.join(" ")}"
+      exit 1
+    end
+  end
+end
 
-  echo ""
-  echo "================================================================"
-  echo "$desc"
-  echo "================================================================"
+def passfail(failed) = failed ? "#{R}FAIL#{X}" : "#{G}PASS#{X}"
 
-  echo ""
-  echo "--- before fix ---"
-  ln -sf "$FLUX_BEFORE" "$BIN_DIR/flux"
-  export PATH="$BIN_DIR:$PATH"
-  before_out=$("$SCRIPT_DIR/$script" 2>&1) || true
-  echo "$before_out"
-  has_failure "$name" "$before_out" && before_fail=1 || before_fail=0
+def verdict_label(v)
+  case v
+  when :fixed     then "#{G}FIXED#{X}"
+  when :ok        then "#{G}OK#{X} #{D}(not affected)#{X}"
+  when :broken    then "#{R}BROKEN#{X} #{D}(not fixed)#{X}"
+  when :regressed then "#{R}REGRESSED#{X}"
+  end
+end
 
-  echo ""
-  echo "--- after fix ---"
-  ln -sf "$FLUX_AFTER" "$BIN_DIR/flux"
-  after_out=$("$SCRIPT_DIR/$script" 2>&1) || true
-  echo "$after_out"
-  has_failure "$name" "$after_out" && after_fail=1 || after_fail=0
+def indent(text) = text.each_line.map { |l| "    #{l}" }.join
 
-  echo ""
-  if [ "$before_fail" -eq 1 ] && [ "$after_fail" -eq 0 ]; then
-    verdict="FIXED"
-    ((fixed++))
-  elif [ "$before_fail" -eq 0 ] && [ "$after_fail" -eq 0 ]; then
-    verdict="OK (not affected)"
-    ((not_affected++))
-  elif [ "$before_fail" -eq 1 ] && [ "$after_fail" -eq 1 ]; then
-    verdict="BROKEN (not fixed)"
-    ((broken++))
-  else
-    verdict="REGRESSED"
-    ((regressed++))
-  fi
-  printf '>> %-24s before=%-4s after=%-4s %s\n' \
-    "$name" \
-    "$([ "$before_fail" -eq 1 ] && echo FAIL || echo PASS)" \
-    "$([ "$after_fail" -eq 1 ] && echo FAIL || echo PASS)" \
-    "$verdict"
-  results+=("$(printf '  %-24s before=%-4s after=%-4s %s' \
-    "$name" \
-    "$([ "$before_fail" -eq 1 ] && echo FAIL || echo PASS)" \
-    "$([ "$after_fail" -eq 1 ] && echo FAIL || echo PASS)" \
-    "$verdict")")
-done
+def run_test(script, binary)
+  FileUtils.ln_sf(binary, FLUX_LINK)
+  env = { "PATH" => "#{BIN_DIR}:#{ENV["PATH"]}" }
+  out, _status = Open3.capture2e(env, File.join(SCRIPT_DIR, script))
+  out
+end
 
-rm -f "$BIN_DIR/flux"
+require "fileutils"
 
-echo ""
-echo "================================================================"
-echo "Summary"
-echo "================================================================"
-for r in "${results[@]}"; do echo "$r"; done
-echo ""
-echo "  fixed: $fixed  ok: $not_affected  broken: $broken  regressed: $regressed"
+results = []
 
-[ "$broken" -eq 0 ] && [ "$regressed" -eq 0 ]
+selected.each_with_index do |t, idx|
+  puts ""
+  puts "#{B}[#{idx + 1}/#{selected.size}] #{t[:desc]}#{X}"
+  puts "#{D}#{"-" * 60}#{X}"
+
+  # Before (unpatched)
+  print "  #{C}BEFORE (unpatched):#{X} "
+  before_out = run_test(t[:script], FLUX_BEFORE)
+  before_fail = FAILURE_PATTERNS[t[:name]].match?(before_out)
+  puts passfail(before_fail)
+  puts indent(before_out)
+  puts ""
+
+  # After (patched)
+  print "  #{C}AFTER  (patched):#{X}   "
+  after_out = run_test(t[:script], FLUX_AFTER)
+  after_fail = FAILURE_PATTERNS[t[:name]].match?(after_out)
+  puts passfail(after_fail)
+  puts indent(after_out)
+  puts ""
+
+  # Verdict
+  verdict = case [before_fail, after_fail]
+    in [true,  false] then :fixed
+    in [false, false] then :ok
+    in [true,  true]  then :broken
+    in [false, true]  then :regressed
+  end
+
+  puts "  Verdict: #{verdict_label(verdict)}"
+
+  results << { name: t[:name], before: before_fail, after: after_fail, verdict: verdict }
+end
+
+FileUtils.rm_f(FLUX_LINK)
+
+# Summary
+puts ""
+puts "#{B}#{"=" * 60}#{X}"
+puts "#{B}Summary#{X}"
+puts "#{B}#{"=" * 60}#{X}"
+puts ""
+puts "  %-26s %-10s %-10s %s" % ["TEST", "BEFORE", "AFTER", "VERDICT"]
+puts "  %-26s %-10s %-10s %s" % ["-" * 26, "-" * 6, "-" * 6, "-" * 10]
+
+results.each do |r|
+  print "  %-26s " % r[:name]
+  print passfail(r[:before])
+  print "%-6s " % ""
+  print passfail(r[:after])
+  print "%-6s " % ""
+  puts verdict_label(r[:verdict])
+end
+
+counts = results.group_by { |r| r[:verdict] }.transform_values(&:size)
+counts.default = 0
+
+puts ""
+print "  #{G}#{counts[:fixed]} fixed#{X}"
+print "  #{G}#{counts[:ok]} ok#{X}"
+broken_c = counts[:broken] > 0 ? R : G
+regressed_c = counts[:regressed] > 0 ? R : G
+print "  #{broken_c}#{counts[:broken]} broken#{X}"
+puts  "  #{regressed_c}#{counts[:regressed]} regressed#{X}"
+puts ""
+
+exit(counts[:broken] > 0 || counts[:regressed] > 0 ? 1 : 0)

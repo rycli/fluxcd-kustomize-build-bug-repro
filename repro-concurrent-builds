@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# vim: ft=bash
+#!/usr/bin/env ruby
+# vim: ft=ruby
 # Reproduces file contention when multiple flux build kustomization processes
 # target the same source directory concurrently.
 #
@@ -7,55 +7,62 @@
 # writes kustomization.yaml, then restores the original via CleanDirectory().
 # Concurrent processes race on these read/write/restore operations.
 
-set -euo pipefail
+require "fileutils"
+require "open3"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-KUSTOMIZE_DIR="$SCRIPT_DIR/kustomize"
-KS_FILE="$SCRIPT_DIR/kustomization.yaml"
-N="${1:-30}"
-strip() { gsed "s|$SCRIPT_DIR/||g"; }
+SCRIPT_DIR    = File.dirname(File.realpath(__FILE__))
+KUSTOMIZE_DIR = File.join(SCRIPT_DIR, "kustomize")
+KS_FILE       = File.join(SCRIPT_DIR, "kustomization.yaml")
+KS_YAML       = File.join(KUSTOMIZE_DIR, "kustomization.yaml")
+N             = (ARGV[0] || 30).to_i
 
-ORIGINAL_CONTENT=$(cat "$KUSTOMIZE_DIR/kustomization.yaml")
-cleanup() {
-  echo "$ORIGINAL_CONTENT" > "$KUSTOMIZE_DIR/kustomization.yaml"
-  rm -f "$KUSTOMIZE_DIR"/*.original
-}
-trap cleanup EXIT
+original_content = File.read(KS_YAML)
 
-echo "Spawning $N concurrent 'flux build kustomization' against ./kustomize"
-echo "---"
+at_exit do
+  File.write(KS_YAML, original_content)
+  Dir.glob(File.join(KUSTOMIZE_DIR, "*.original")).each { |f| File.delete(f) }
+end
 
-pids=()
-tmpdir="$SCRIPT_DIR/.tmp/concurrent-builds"
-rm -rf "$tmpdir"
-mkdir -p "$tmpdir"
+strip = ->(s) { s.gsub("#{SCRIPT_DIR}/", "") }
 
-for i in $(seq 1 "$N"); do
-  (
-    flux build kustomization repro-test \
-      --path "$KUSTOMIZE_DIR" \
-      --kustomization-file "$KS_FILE" \
-      --dry-run \
-      >"$tmpdir/stdout.$i" 2>"$tmpdir/stderr.$i"
-    echo "$?" >"$tmpdir/exit.$i"
-  ) &
-  pids+=($!)
-done
+puts "Spawning #{N} concurrent 'flux build kustomization' against ./kustomize"
+puts "---"
 
-failures=0
-for pid in "${pids[@]}"; do
-  wait "$pid" || ((failures++)) || true
-done
+results = Array.new(N)
+threads = N.times.map do |i|
+  Thread.new(i) do |idx|
+    out, err, status = Open3.capture3(
+      "flux", "build", "kustomization", "repro-test",
+      "--path", KUSTOMIZE_DIR,
+      "--kustomization-file", KS_FILE,
+      "--dry-run"
+    )
+    results[idx] = { stdout: out, stderr: err, status: status }
+  end
+end
+threads.each(&:join)
 
-echo "Succeeded: $((N - failures))/$N"
-echo "Failed:    $failures/$N"
+failures = results.count { |r| !r[:status].success? }
+puts "Succeeded: #{N - failures}/#{N}"
+puts "Failed:    #{failures}/#{N}"
 
-for i in $(seq 1 "$N"); do
-  [ -s "$tmpdir/stderr.$i" ] && echo "" && echo "process $i stderr:" && cat "$tmpdir/stderr.$i" | strip
-done
+results.each_with_index do |r, i|
+  next if r[:stderr].empty?
+  puts ""
+  puts "process #{i + 1} stderr:"
+  puts strip.call(r[:stderr])
+end
 
-if ! grep -q 'configmap.yaml' "$KUSTOMIZE_DIR/kustomization.yaml" 2>/dev/null; then
-  echo "" && echo "kustomization.yaml after run:" && cat "$KUSTOMIZE_DIR/kustomization.yaml"
-fi
+unless File.read(KS_YAML).include?("configmap.yaml")
+  puts ""
+  puts "kustomization.yaml after run:"
+  puts File.read(KS_YAML)
+end
 
-ls "$KUSTOMIZE_DIR"/*.original 2>/dev/null | strip && echo "" && ls -la "$KUSTOMIZE_DIR"/*.original | strip
+originals = Dir.glob(File.join(KUSTOMIZE_DIR, "*.original"))
+unless originals.empty?
+  puts ""
+  originals.each { |f| puts strip.call(f) }
+  puts ""
+  originals.each { |f| puts strip.call(`ls -la #{f}`.chomp) }
+end

@@ -1,39 +1,41 @@
-#!/usr/bin/env bash
-# vim: ft=bash
+#!/usr/bin/env ruby
+# vim: ft=ruby
 # Reproduces failures when flux build kustomization targets a read-only directory.
 #
 # Flux's WriteFile() writes a modified kustomization.yaml and creates .original
 # backups. On a read-only filesystem these writes fail with EPERM/EROFS.
 
-set -uo pipefail
+require "fileutils"
+require "open3"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-KS_FILE="$SCRIPT_DIR/kustomization.yaml"
-RO_DIR="$SCRIPT_DIR/.tmp/ro-kustomize"
+SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
+KS_FILE    = File.join(SCRIPT_DIR, "kustomization.yaml")
+RO_DIR     = File.join(SCRIPT_DIR, ".tmp", "ro-kustomize")
 
-cleanup() {
-  chmod -R u+w "$RO_DIR" 2>/dev/null || true
-  rm -rf "$RO_DIR"
-}
-trap cleanup EXIT
+at_exit do
+  FileUtils.chmod_R("u+w", RO_DIR) rescue nil
+  FileUtils.rm_rf(RO_DIR)
+end
 
-rm -rf "$RO_DIR"
-mkdir -p "$RO_DIR"
-cp "$SCRIPT_DIR/kustomize/"* "$RO_DIR/"
+FileUtils.rm_rf(RO_DIR)
+FileUtils.mkdir_p(RO_DIR)
+Dir.glob(File.join(SCRIPT_DIR, "kustomize", "*")).each { |f| FileUtils.cp(f, RO_DIR) }
 
-echo "Making .tmp/ro-kustomize read-only"
-chmod -R a-w "$RO_DIR"
+puts "Making .tmp/ro-kustomize read-only"
+FileUtils.chmod_R("a-w", RO_DIR)
 
-echo "Running flux build kustomization against read-only directory..."
-echo "---"
+puts "Running flux build kustomization against read-only directory..."
+puts "---"
 
-flux build kustomization repro-test \
-  --path "$RO_DIR" \
-  --kustomization-file "$KS_FILE" \
-  --dry-run 2>&1 | gsed "s|$SCRIPT_DIR/||g"
-rc=${PIPESTATUS[0]}
+out, status = Open3.capture2e(
+  "flux", "build", "kustomization", "repro-test",
+  "--path", RO_DIR,
+  "--kustomization-file", KS_FILE,
+  "--dry-run"
+)
 
-echo "---"
-echo "Exit code: $rc"
+puts out.gsub("#{SCRIPT_DIR}/", "")
+puts "---"
+puts "Exit code: #{status.exitstatus}"
 
-exit "$rc"
+exit status.exitstatus
